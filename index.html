@@ -91,7 +91,7 @@ var LIES = [
 ];
 var MISS_OPTS = [
   {id:"izquierda",label:"◀ Izq",  col:"#60a5fa"},
-  {id:"derecha",  label:"Der ▶",  col:"#f97316"},
+  {id:"derecha",  label:"▶ Der",  col:"#f97316"},
   {id:"largo",    label:"▲ Largo",col:"#c084fc"},
   {id:"corto",    label:"▼ Corto",col:"#fb923c"},
 ];
@@ -143,8 +143,11 @@ function calcSG(shots, par, holeLength) {
     } else {
       ee = 0; // last shot = holed
     }
+    // Penalty modifier: each penalty stroke costs -1 extra SG
+    // SG = (se - ee) - 1 (shot) - penaltyStrokes
+    var penStrokes = s.penalty || 0;
     return Object.assign({},s,{
-      sg: parseFloat((se-ee-1).toFixed(3)),
+      sg: parseFloat((se - ee - 1 - penStrokes).toFixed(3)),
       sgCat: getSGCat(s.lie, s.distanceToHole, i, par)
     });
   });
@@ -268,11 +271,15 @@ function aggregateStats(rounds, hcp) {
       var sg=calcSG(hole.shots,hole.par,hole.holeLength||null);
       sg.forEach(function(s,idx){
         var d=parseFloat(s.distanceToHole);
-        if((s.sgCat==="approach"||s.sgCat==="aroundGreen")&&d>=z.min&&d<z.max&&s.sg!==null){
+        // Exclude: layup shots and par5 second shot (idx=1) from proximity
+        var isPar5Second = hole.par===5 && idx===1;
+        var isLayup = s.layup===true;
+        if((s.sgCat==="approach"||s.sgCat==="aroundGreen")&&d>=z.min&&d<z.max&&s.sg!==null&&!isPar5Second&&!isLayup){
           sgVals.push(s.sg);
           // Proximidad = distancia del siguiente golpe (donde quedó la bola)
+          // Skip if next shot is a penalty
           var next = hole.shots[idx+1];
-          if(next){ var prox=parseFloat(next.distanceToHole); if(!isNaN(prox)&&prox>=0) proxVals.push(prox); }
+          if(next&&!next.layup){ var prox=parseFloat(next.distanceToHole); if(!isNaN(prox)&&prox>=0) proxVals.push(prox); }
         }
       });
     });});
@@ -326,16 +333,121 @@ function aggregateStats(rounds, hcp) {
 
 // ─── VOICE PARSER ─────────────────────────────────────────────────────────────
 function parseVoice(text) {
-  var t = text.toLowerCase().trim(); var result={};
-  var lieMap={tee:["tee","salida"],calle:["calle","fairway"],rough:["rough","ruf","hierba"],bunker:["bunker","arena","trampa"],green:["green","grin"]};
-  for(var li in lieMap){if(lieMap[li].some(function(w){return t.indexOf(w)>=0;})){result.lie=li;break;}}
-  var dm=t.match(/(\d+[.,]\d+|\d+)\s*m?/); if(dm){result.distanceToHole=dm[1].replace(",",".");}
-  var clubMap={"Driver":["driver","draiber","drive"],"Madera 3":["madera tres","madera 3","tres madera"],"Híbrido 2":["hibrido dos","híbrido dos","hibrido 2"],"Híbrido 3":["hibrido tres","híbrido tres","hibrido 3"],"Híbrido 4":["hibrido cuatro","híbrido cuatro","hibrido 4"],"Hierro 4":["hierro cuatro","hierro 4","cuatro hierro"],"Hierro 5":["hierro cinco","hierro 5","cinco hierro"],"Hierro 6":["hierro seis","hierro 6","seis hierro"],"Hierro 7":["hierro siete","hierro 7","siete hierro"],"Hierro 8":["hierro ocho","hierro 8","ocho hierro"],"Hierro 9":["hierro nueve","hierro 9","nueve hierro"],"PW":["pitching","pitch","pw"],"54":["cincuenta y cuatro","54","wedge 54"],"58":["cincuenta y ocho","58","wedge 58"],"Putter":["putter","puter","putt","pata"]};
-  for(var ci in clubMap){if(clubMap[ci].some(function(w){return t.indexOf(w)>=0;})){result.club=ci;break;}}
-  if(t.indexOf("izquierda")>=0) result.miss="izquierda";
-  else if(t.indexOf("derecha")>=0) result.miss="derecha";
-  else if(t.indexOf("largo")>=0) result.miss="largo";
-  else if(t.indexOf("corto")>=0) result.miss="corto";
+  var t = text.toLowerCase().trim();
+  // Normalize: remove accents for comparison
+  var tn = t.normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+  var result = {};
+
+  // ── LIE ─────────────────────────────────────────────────────────────────────
+  var lieMap = {
+    tee:    ["tee","salida","te ","te$"],
+    calle:  ["calle","fairway","feri","en calle"],
+    rough:  ["rough","ruf","hierba","en el rough","en rough"],
+    bunker: ["bunker","bun ker","arena","trampa","en bunker"],
+    green:  ["green","grin","en el green","en green"],
+  };
+  // Check lies in order, using word boundary awareness
+  var lieKeys = ["green","bunker","rough","calle","tee"];
+  for (var li=0; li<lieKeys.length; li++) {
+    var lie = lieKeys[li];
+    var words = lieMap[lie];
+    var found = false;
+    for (var wi=0; wi<words.length; wi++) {
+      if (tn.indexOf(words[wi].normalize("NFD").replace(/[\u0300-\u036f]/g,"")) >= 0) {
+        found = true; break;
+      }
+    }
+    if (found) { result.lie = lie; break; }
+  }
+
+  // ── DISTANCE ─────────────────────────────────────────────────────────────────
+  // Match numbers: "trescientos ochenta" or "380" or "3.5" or "medio"
+  var numWords = {
+    "cero":0,"uno":1,"dos":2,"tres":3,"cuatro":4,"cinco":5,"seis":6,"siete":7,
+    "ocho":8,"nueve":9,"diez":10,"once":11,"doce":12,"trece":13,"catorce":14,
+    "quince":15,"dieciseis":16,"diecisiete":17,"dieciocho":18,"diecinueve":19,
+    "veinte":20,"veintiuno":21,"veintidos":22,"veintitres":23,"veinticuatro":24,
+    "veinticinco":25,"veintiseis":26,"veintisiete":27,"veintiocho":28,"veintinueve":29,
+    "treinta":30,"cuarenta":40,"cincuenta":50,"sesenta":60,"setenta":70,
+    "ochenta":80,"noventa":90,"cien":100,"ciento":100,
+    "doscientos":200,"trescientos":300,"cuatrocientos":400,"quinientos":500,
+  };
+  if (tn.indexOf("medio") >= 0 || tn.indexOf("y medio") >= 0) {
+    result.distanceToHole = "0.5";
+  } else {
+    // Try numeric first
+    var dm = t.match(/(\d+[.,]\d+|\d+)/);
+    if (dm) {
+      var num = parseFloat(dm[1].replace(",","."));
+      // Avoid picking up club numbers like "hierro 7" as distance
+      // If number is 1-9 and we also have "hierro" nearby, skip
+      var isClubNum = (num >= 1 && num <= 9) && 
+        (tn.indexOf("hierro") >= 0 || tn.indexOf("madera") >= 0 || tn.indexOf("hibrido") >= 0);
+      if (!isClubNum) {
+        result.distanceToHole = dm[1].replace(",",".");
+      }
+    }
+    // Try word numbers if no digit found
+    if (!result.distanceToHole) {
+      var tnNorm = tn;
+      var dist = 0;
+      // Sort by value descending to avoid "tres" matching before "trescientos"
+      var numKeys = Object.keys(numWords).sort(function(a,b){return numWords[b]-numWords[a];});
+      for (var ni=0; ni<numKeys.length; ni++) {
+        var nk = numKeys[ni];
+        if (tnNorm.indexOf(nk) >= 0) {
+          dist += numWords[nk];
+          tnNorm = tnNorm.replace(nk, "");
+        }
+      }
+      if (dist > 0) result.distanceToHole = String(dist);
+    }
+  }
+
+  // ── CLUB ─────────────────────────────────────────────────────────────────────
+  // Order matters: check more specific patterns first
+  // Use word boundaries by checking surrounding chars
+  function hasWord(str, word) {
+    var idx = str.indexOf(word);
+    if (idx < 0) return false;
+    var before = idx === 0 ? " " : str[idx-1];
+    var after = idx+word.length >= str.length ? " " : str[idx+word.length];
+    return /[\s,.]/.test(before) || idx===0 || /[\s,.]/.test(after) || idx+word.length===str.length;
+  }
+
+  var clubTests = [
+    // Specific multi-word first
+    ["Madera 3",  function(s){return s.indexOf("madera") >= 0;}],
+    ["Híbrido 2", function(s){return (s.indexOf("hibrido") >= 0 || s.indexOf("hibrido") >= 0) && (s.indexOf("dos") >= 0 || s.indexOf(" 2") >= 0);}],
+    ["Híbrido 3", function(s){return (s.indexOf("hibrido") >= 0) && (s.indexOf("tres") >= 0 || s.indexOf(" 3") >= 0) && s.indexOf("trescientos") < 0;}],
+    ["Híbrido 4", function(s){return (s.indexOf("hibrido") >= 0) && (s.indexOf("cuatro") >= 0 || s.indexOf(" 4") >= 0);}],
+    ["Hierro 4",  function(s){return s.indexOf("hierro") >= 0 && (s.indexOf("cuatro") >= 0 || / 4[ $]/.test(s) || s.indexOf(" 4") >= 0 && s.indexOf("cuatro") < 0 && (s.match(/ 4/) || [''])[0].length > 0);}],
+    ["Hierro 5",  function(s){return s.indexOf("hierro") >= 0 && (s.indexOf("cinco") >= 0 || s.indexOf(" 5") >= 0);}],
+    ["Hierro 6",  function(s){return s.indexOf("hierro") >= 0 && (s.indexOf("seis") >= 0 || s.indexOf(" 6") >= 0);}],
+    ["Hierro 7",  function(s){return s.indexOf("hierro") >= 0 && (s.indexOf("siete") >= 0 || s.indexOf(" 7") >= 0);}],
+    ["Hierro 8",  function(s){return s.indexOf("hierro") >= 0 && (s.indexOf("ocho") >= 0 || s.indexOf(" 8") >= 0);}],
+    ["Hierro 9",  function(s){return s.indexOf("hierro") >= 0 && (s.indexOf("nueve") >= 0 || s.indexOf(" 9") >= 0);}],
+    ["PW",        function(s){return s.indexOf("pitching") >= 0 || s.indexOf("pitch") >= 0 || s === "pw" || s.indexOf(" pw") >= 0 || s.indexOf("pw ") >= 0;}],
+    ["54",        function(s){return s.indexOf("cincuenta y cuatro") >= 0 || s.indexOf("cincuenta cuatro") >= 0 || s.indexOf("54") >= 0 || (s.indexOf("cincuenta") >= 0 && s.indexOf("cuatro") >= 0);}],
+    ["58",        function(s){return s.indexOf("cincuenta y ocho") >= 0 || s.indexOf("cincuenta ocho") >= 0 || s.indexOf("58") >= 0 || (s.indexOf("cincuenta") >= 0 && s.indexOf("ocho") >= 0);}],
+    ["Putter",    function(s){return s.indexOf("putter") >= 0 || s.indexOf("puter") >= 0 || s.indexOf("putt") >= 0 || s.indexOf("pata") >= 0;}],
+    // Driver last — most generic, avoid matching "drive" in irrelevant words
+    ["Driver",    function(s){return s.indexOf("driver") >= 0 || s.indexOf("draiber") >= 0 || /\bdriver\b/.test(s) || s.endsWith("driver") || s.startsWith("driver");}],
+  ];
+
+  for (var ci=0; ci<clubTests.length; ci++) {
+    if (clubTests[ci][1](tn)) {
+      result.club = clubTests[ci][0];
+      break;
+    }
+  }
+
+  // ── MISS ─────────────────────────────────────────────────────────────────────
+  if (t.indexOf("izquierda") >= 0 || tn.indexOf("izquierda") >= 0) result.miss = "izquierda";
+  else if (t.indexOf("derecha") >= 0 || tn.indexOf("derecha") >= 0) result.miss = "derecha";
+  else if (t.indexOf("largo") >= 0) result.miss = "largo";
+  else if (t.indexOf("corto") >= 0) result.miss = "corto";
+
   return result;
 }
 
@@ -608,7 +720,7 @@ function App() {
   var [view,     setView]     = useState("home");
   var [activeId, setActiveId] = useState(null);
   var [holeIdx,  setHoleIdx]  = useState(0);
-  var [form,     setForm]     = useState({lie:"",distanceToHole:"",club:"",miss:""});
+  var [form,     setForm]     = useState({lie:"",distanceToHole:"",club:"",miss:"",penalty:0,layup:false});
   var [editIdx,  setEditIdx]  = useState(null);
   var [showModal,setShowModal]= useState(false);
   var [course,   setCourse]   = useState("");
@@ -638,10 +750,23 @@ function App() {
       var s=localStorage.getItem(STORAGE_KEY); if(s){var d=JSON.parse(s);setRounds(d);roundsRef.current=d;}
       var h=localStorage.getItem("golf-hcp"); if(h!==null) setHcp(parseFloat(h)||null);
       var cs=localStorage.getItem("golf-courses"); if(cs){var cd=JSON.parse(cs);setCourses(cd);coursesRef.current=cd;}
+      var nav=localStorage.getItem("golf-nav");
+      if(nav){
+        var nd=JSON.parse(nav);
+        // Only restore if the round still exists
+        var rounds2=roundsRef.current;
+        if(nd.activeId && rounds2.find(function(r){return r.id===nd.activeId;})){
+          setActiveId(nd.activeId);
+          setHoleIdx(nd.holeIdx||0);
+          setView("round");
+        }
+      }
     }catch(e){}
     setLoaded(true);
   },[]);
   function save(r){setRounds(r);roundsRef.current=r;try{localStorage.setItem(STORAGE_KEY,JSON.stringify(r));}catch(e){}}
+  function saveNavState(id, idx){try{localStorage.setItem("golf-nav",JSON.stringify({activeId:id,holeIdx:idx,view:"round"}));}catch(e){}}
+  function clearNavState(){try{localStorage.removeItem("golf-nav");}catch(e){}}
   function saveHcp(v){
     setHcp(v);
     try{
@@ -674,7 +799,9 @@ function App() {
     var h0=holes[0];
     var autoD0=(h0&&h0.par>=4&&h0.holeLength)?String(h0.holeLength):"";
     setForm({lie:autoD0?"tee":"",distanceToHole:autoD0,club:"",miss:""});
-    setShowModal(false);setCourse("");setSelCourse(null);setSelTee(null);setView("round");
+    setShowModal(false);setCourse("");setSelCourse(null);setSelTee(null);
+    saveNavState(id, 0);
+    setView("round");
   }
   function deleteRound(id){save(roundsRef.current.filter(function(r){return r.id!==id;}));}
 
@@ -724,6 +851,7 @@ function App() {
     var hh = round ? round.holes[i] : null;
     var autoD = (hh && hh.shots.length===0 && hh.par>=4 && hh.holeLength) ? String(hh.holeLength) : "";
     setForm({lie:autoD?"tee":"",distanceToHole:autoD,club:"",miss:""});
+    saveNavState(activeId, i);
   }
   function setPar(p){
     updateHole(holeIdx,function(h){return Object.assign({},h,{par:p});});
@@ -737,16 +865,20 @@ function App() {
   }
   function setHoleLength(v){updateHole(holeIdx,function(h){return Object.assign({},h,{holeLength:v?parseFloat(v):null});});}
   function addShot(){
-    if(!form.lie||!form.distanceToHole||!form.club)return;
-    var s={id:Date.now()+"",lie:form.lie,distanceToHole:form.distanceToHole,club:form.club,miss:form.miss||""};
+    if(!form.lie||!form.distanceToHole)return;
+    var club = form.club || (form.lie==="green"?"Putter":"");
+    if(!club)return;
+    var s={id:Date.now()+"",lie:form.lie,distanceToHole:form.distanceToHole,club:club,
+           miss:form.miss||"",penalty:form.penalty||0,layup:form.layup||false};
     updateHole(holeIdx,function(h){
       var ns=editIdx!==null?h.shots.map(function(x,i){return i===editIdx?s:x;}):h.shots.concat(s);
       return Object.assign({},h,{shots:ns});
     });
-    setForm({lie:"",distanceToHole:"",club:"",miss:""});setEditIdx(null);
+    setForm({lie:"",distanceToHole:"",club:"",miss:"",penalty:0,layup:false});
+    setEditIdx(null);
   }
   function startEdit(i){var s=shots[i];setForm({lie:s.lie,distanceToHole:s.distanceToHole,club:s.club,miss:s.miss||""});setEditIdx(i);}
-  function cancelEdit(){setForm({lie:"",distanceToHole:"",club:"",miss:""});setEditIdx(null);}
+  function cancelEdit(){setForm({lie:"",distanceToHole:"",club:"",miss:"",penalty:0,layup:false});setEditIdx(null);}
   function removeShot(i){updateHole(holeIdx,function(h){return Object.assign({},h,{shots:h.shots.filter(function(_,j){return j!==i;})});});}
 
   // Voice
@@ -1081,7 +1213,7 @@ function App() {
               h("span",{style:C.lbl},"Rondas recientes"),
               rounds.slice(0,20).map(function(r){
                 var st=roundStats(r);
-                return h("div",{key:r.id,style:Object.assign({},C.card,{cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}),onClick:function(){setActiveId(r.id);setHoleIdx(0);setForm({lie:"",distanceToHole:"",club:"",miss:""});setEditIdx(null);setView("round");}},
+                return h("div",{key:r.id,style:Object.assign({},C.card,{cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}),onClick:function(){setActiveId(r.id);setHoleIdx(0);setForm({lie:"",distanceToHole:"",club:"",miss:"",penalty:0,layup:false});setEditIdx(null);setView("round");}},
                   h("div",null,
                     h("div",{style:{display:"flex",alignItems:"center",gap:7}},
                       h("div",{style:{fontSize:14,fontWeight:700,color:"#bbf7d0"}},(r.course||"—")),
@@ -1172,6 +1304,8 @@ function App() {
                       h("span",{style:{fontSize:11,fontWeight:600,color:"#bbf7d0",flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},s.club),
                       h("span",{style:{fontSize:10,color:"#4b7a56",flexShrink:0}},s.distanceToHole+"m"),
                       mo&&h("span",{style:{fontSize:10,color:mo.col,flexShrink:0}},mo.id==="izquierda"?"◀":mo.id==="derecha"?"▶":mo.id==="largo"?"▲":"▼"),
+                      s.penalty>0&&h("span",{style:{fontSize:10,color:"#f87171",flexShrink:0}},"🔴+"+s.penalty),
+                      s.layup&&h("span",{style:{fontSize:10,color:"#c084fc",flexShrink:0}},"🎯"),
                       s.sg!==null&&h("span",{style:{fontSize:10,fontWeight:700,width:38,textAlign:"right",flexShrink:0,color:sgCol(s.sg)}},fmt(s.sg,2)),
                       h("button",{onClick:function(){startEdit(idx);},style:{background:"none",border:"none",cursor:"pointer",color:"#2d5535",fontSize:13,padding:"2px",touchAction:"manipulation"}},"✏️"),
                       h("button",{onClick:function(){removeShot(idx);},style:{background:"none",border:"none",cursor:"pointer",color:"#3d1515",fontSize:13,padding:"2px",touchAction:"manipulation"}},"✕")
@@ -1188,8 +1322,10 @@ function App() {
                       h("span",{style:{fontSize:14}},vIcon), h("span",null,vLabel)
                     )
                   ),
-                  h("div",{style:{marginBottom:10,padding:"6px 9px",background:"#080f09",borderRadius:7,border:"1px solid #0d2010",fontSize:10,color:"#2d5535",lineHeight:1.6}},
-                    'Di: ',h("span",{style:{color:"#4b7a56"}},'"Tee 380 Driver"'),' · ',h("span",{style:{color:"#4b7a56"}},'"Green 3 Putter"')
+                  h("div",{style:{marginBottom:10,padding:"6px 9px",background:"#080f09",borderRadius:7,border:"1px solid #0d2010",fontSize:10,color:"#2d5535",lineHeight:1.7}},
+                    'Ej: ',h("span",{style:{color:"#4b7a56"}},'"Tee trescientos ochenta driver"'),h("br",null),
+                    h("span",{style:{color:"#4b7a56"}},'"Calle ciento veinte hierro siete"'),h("br",null),
+                    h("span",{style:{color:"#4b7a56"}},'"Green tres putter"'),' · ',h("span",{style:{color:"#4b7a56"}},'"Bunker veinte cincuenta y ocho"')
                   ),
                   vText&&vState!=="idle"&&h("div",{style:{marginBottom:9,padding:"6px 9px",background:"#0a1a0c",borderRadius:7,fontSize:11,color:vState==="ok"?"#4ade80":vState==="error"?"#f87171":"#4b7a56",fontStyle:"italic"}},'"'+vText+'"'),
 
@@ -1197,7 +1333,43 @@ function App() {
                   h("div",{style:{marginBottom:11}},
                     h("span",{style:C.sub},"Lie"),
                     h("div",{style:{display:"flex",gap:5,flexWrap:"wrap"}},
-                      LIES.map(function(l){return h("button",{key:l.id,onClick:function(){setForm(function(f){return Object.assign({},f,{lie:l.id,miss:""}); });},style:chip(form.lie===l.id,l.col)},l.icon+" "+l.label);})
+                      LIES.map(function(l){return h("button",{key:l.id,onClick:function(){setForm(function(f){
+                          var nextClub = l.id==="green"&&!f.club ? "Putter" : f.club;
+                          return Object.assign({},f,{lie:l.id,miss:"",club:nextClub,penalty:0,layup:false});
+                        });},style:chip(form.lie===l.id,l.col)},l.icon+" "+l.label);})
+                    )
+                  ),
+
+                  // Penalty toggle + selector
+                  form.lie&&form.lie!=="green"&&h("div",{style:{marginBottom:11}},
+                    h("button",{onClick:function(){setForm(function(f){return Object.assign({},f,{penalty:f.penalty>0?0:1});});},
+                      style:{padding:"7px 13px",border:form.penalty>0?"2px solid #f87171":"1px solid #1a3d20",
+                        borderRadius:8,background:form.penalty>0?"#2a0a0a":"#080f09",
+                        color:form.penalty>0?"#f87171":"#4b7a56",fontSize:12,cursor:"pointer",
+                        fontFamily:"Georgia,serif",touchAction:"manipulation"}},
+                      "🔴 Penalidad"+(form.penalty>0?" +"+form.penalty:"")
+                    ),
+                    form.penalty>0&&h("div",{style:{display:"flex",gap:6,marginTop:7}},
+                      [1,2].map(function(n){
+                        return h("button",{key:n,onClick:function(){setForm(function(f){return Object.assign({},f,{penalty:n});});},
+                          style:{padding:"7px 18px",border:form.penalty===n?"2px solid #f87171":"1px solid #1a3d20",
+                            borderRadius:8,background:form.penalty===n?"#2a0a0a":"#080f09",
+                            color:form.penalty===n?"#f87171":"#4b7a56",fontSize:13,fontWeight:form.penalty===n?700:400,
+                            cursor:"pointer",fontFamily:"Georgia,serif",touchAction:"manipulation"}},
+                          "+"+n
+                        );
+                      })
+                    )
+                  ),
+
+                  // Layup toggle (shown for non-green, non-penalty shots)
+                  form.lie&&form.lie!=="green"&&h("div",{style:{marginBottom:11}},
+                    h("button",{onClick:function(){setForm(function(f){return Object.assign({},f,{layup:!f.layup});});},
+                      style:{padding:"7px 14px",border:form.layup?"2px solid #c084fc":"1px solid #1a3d20",
+                        borderRadius:8,background:form.layup?"#1a0a2a":"#080f09",
+                        color:form.layup?"#c084fc":"#4b7a56",fontSize:12,cursor:"pointer",
+                        fontFamily:"Georgia,serif",touchAction:"manipulation"}},
+                      "🎯 Lay up / Volver a calle"+(form.layup?" ✓":"")
                     )
                   ),
 
@@ -1224,7 +1396,7 @@ function App() {
                   ),
 
                   h("div",{style:{display:"flex",gap:8}},
-                    h("button",{onClick:addShot,disabled:!form.lie||!form.club||!form.distanceToHole,style:pbtn(!!(form.lie&&form.club&&form.distanceToHole))},editIdx!==null?"✓ Guardar cambios":"+ Añadir golpe"),
+                    h("button",{onClick:addShot,disabled:!form.lie||!form.distanceToHole||(!form.club&&form.lie!=="green"),style:pbtn(!!(form.lie&&form.distanceToHole&&(form.club||form.lie==="green")))},editIdx!==null?"✓ Guardar cambios":"+ Añadir golpe"),
                     editIdx!==null&&h("button",{onClick:cancelEdit,style:{padding:"13px 14px",border:"1px solid #1a3d20",borderRadius:10,background:"transparent",color:"#4b7a56",fontSize:13,cursor:"pointer",fontFamily:"Georgia,serif",touchAction:"manipulation"}},"Cancelar")
                   )
                 )
@@ -1235,7 +1407,7 @@ function App() {
                 h("button",{onClick:function(){goHole(Math.max(0,holeIdx-1));},disabled:holeIdx===0,style:{flex:1,padding:"12px 0",border:"1px solid #1a3d20",borderRadius:10,background:"transparent",color:holeIdx>0?"#4ade80":"#1a3d20",fontSize:13,cursor:holeIdx>0?"pointer":"default",fontFamily:"Georgia,serif",touchAction:"manipulation"}},"← Anterior"),
                 h("button",{onClick:function(){goHole(Math.min(17,holeIdx+1));},disabled:holeIdx===17,style:{flex:1,padding:"12px 0",border:"1px solid #1a3d20",borderRadius:10,background:holeIdx<17?"#0d2a14":"transparent",color:holeIdx<17?"#4ade80":"#1a3d20",fontSize:13,cursor:holeIdx<17?"pointer":"default",fontFamily:"Georgia,serif",fontWeight:600,touchAction:"manipulation"}},"Siguiente →")
               ),
-              h("button",{onClick:function(){setView("home");},style:{width:"100%",marginTop:8,padding:"11px 0",border:"1px solid #1a3d20",borderRadius:10,background:"transparent",color:"#4b7a56",fontSize:11,cursor:"pointer",fontFamily:"Georgia,serif",touchAction:"manipulation"}},"✓ Guardar y salir de la ronda")
+              h("button",{onClick:function(){clearNavState();setView("home");},style:{width:"100%",marginTop:8,padding:"11px 0",border:"1px solid #1a3d20",borderRadius:10,background:"transparent",color:"#4b7a56",fontSize:11,cursor:"pointer",fontFamily:"Georgia,serif",touchAction:"manipulation"}},"✓ Guardar y salir de la ronda")
             )
       ),
 
@@ -1344,6 +1516,9 @@ function App() {
                 ),
                 hcp===null&&h("div",{style:{padding:"9px 12px",marginBottom:12,background:"#080f09",borderRadius:9,border:"1px solid #0d2010",fontSize:10,color:"#4b7a56"}},
                   "Comparando contra el PGA Tour. Pulsa ",h("span",{style:{color:"#4ade80"}},"Hcp"),h("span",{style:{color:"#4ade80"}},h("span",{style:{fontSize:9}}," ▲"))," para ajustar a tu nivel."
+                ),
+                h("div",{style:{padding:"8px 11px",marginBottom:12,background:"#080f09",borderRadius:9,border:"1px solid #0d2010",fontSize:9,color:"#2d5535",lineHeight:1.6}},
+                  "ℹ️ El SG Putting y el SG del Putter en la pestaña Palos pueden diferir si algún golpe desde green no tiene palo registrado, o porque uno promedia por ronda y el otro por golpe."
                 ),
                 [
                   {k:"avgOT",  label:"Off the Tee",  emoji:"🏌️", exp:stats.hcpAdj?stats.hcpAdj.offTee:0},
